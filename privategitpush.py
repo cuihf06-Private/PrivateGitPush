@@ -11,10 +11,15 @@ PrivateGitPush - 将 git 仓库通过 SSH 推送到私有服务器
 6. 配置 git remote 并推送
 
 .gitprivatetarget 格式 (每行一个目标):
+  # 显式 remote 名 (推荐，与位置无关)
+  origin user@host:port /path/to/repos/base/dir [repo_name]
+  github https://github.com/user/repo
+  # SSH 格式 (原有，按位置分配)
   user@host:port /path/to/repos/base/dir [repo_name]
 
 示例:
-  cuihf@tinybot.cloud:29798 /data1/cuihf/GitRepos
+  origin cuihf@tinybot.cloud:29798 /data1/cuihf/GitRepos PrivateGitPush
+  github https://github.com/cuihf/myproject
   cuihf@tinybot.cloud:29798 /data1/cuihf/GitRepos myproject
   cuihf@192.168.1.100:22 /home/user/repos another-repo
 """
@@ -251,8 +256,15 @@ def parse_gitprivatetarget(filepath):
     """
     解析 .gitprivatetarget 文件。
 
-    格式: user@host:port /path/to/repos/dir [repo_name]
-    - repo_name 留空时运行时交互询问
+    支持三种写法:
+    1. 显式 remote 名: <remote_name> <ssh_spec> <base_path> [repo_name]
+       交换行顺序不影响 remote 名映射。
+    2. SSH 格式 (原有): user@host:port /path/to/repos/dir [repo_name]
+       - repo_name 留空时运行时交互询问
+    3. URL 格式: <remote_name> <url> 或 <url>
+       仅配置 remote，不 SSH 创建裸仓库。
+
+    检测规则: 第一个词不含 @ 且不以 URL 前缀开头 → 视为 remote 名
     """
     targets = []
     with open(filepath, 'r') as f:
@@ -262,13 +274,46 @@ def parse_gitprivatetarget(filepath):
                 continue
 
             parts = line.split()
-            if len(parts) < 2:
+            first_word = parts[0]
+
+            # ── 检测第一列是否为显式 remote 名 ──
+            is_name_prefix = (
+                '@' not in first_word
+                and not re.match(r'^https?://', first_word)
+                and not re.match(r'^ssh://', first_word)
+                and not re.match(r'^git@', first_word)
+                and re.match(r'^[a-zA-Z][a-zA-Z0-9_.-]*$', first_word)
+            )
+
+            if is_name_prefix and len(parts) >= 2:
+                explicit_name = first_word
+                rest = parts[1:]
+            else:
+                explicit_name = None
+                rest = parts
+
+            # ── URL 格式 ──
+            if rest and (
+                re.match(r'^https?://', rest[0])
+                or re.match(r'^ssh://', rest[0])
+                or re.match(r'^git@', rest[0])
+            ):
+                url = rest[0]
+                targets.append({
+                    'type': 'url',
+                    'url': url,
+                    'explicit_remote_name': explicit_name,
+                })
+                continue
+
+            # ── SSH 格式 ──
+            if len(rest) < 2:
                 cprint(C_RED, f"第 {lineno} 行格式错误: {line}")
                 continue
 
-            ssh_spec = parts[0]       # e.g. cuihf@tinybot.cloud:29798
-            base_path = parts[1]      # e.g. /data1/cuihf/GitRepos
-            repo_name = parts[2] if len(parts) >= 3 else None
+            ssh_spec = rest[0]       # e.g. cuihf@tinybot.cloud:29798
+            base_path = rest[1]      # e.g. /data1/cuihf/GitRepos
+            repo_name = rest[2] if len(rest) >= 3 else None
 
             # 解析 SSH 地址: user@host:port 或 user@host (默认端口22)
             m = re.match(r'^([^@]+)@([^:]+):(\d+)$', ssh_spec)
@@ -284,9 +329,11 @@ def parse_gitprivatetarget(filepath):
                     continue
 
             targets.append({
+                'type': 'ssh',
                 'user': user, 'host': host, 'port': port,
                 'base_path': base_path, 'repo_name': repo_name,
                 'ssh_spec': ssh_spec,
+                'explicit_remote_name': explicit_name,
             })
     return targets
 
@@ -352,32 +399,32 @@ def setup_remote(name, url):
     return True
 
 
-def set_default_push_config(branch_name):
+def set_default_push_config(branch_name, pull_source_name='origin'):
     """
     设置当前分支的默认推送配置。
-    
-    - origin 作为默认拉取源 (第一个目标)
+
+    - pull_source_name 作为默认拉取源 (第一行目标，无论 remote 名)
     - 自动配置 branch.<name>.remote 和 push
     """
     cprint(C_BLUE, "设置默认推送配置...")
-    
-    # 设置 origin 为默认拉取源
-    git_cmd("config", "--local", f"branch.{branch_name}.remote", "origin")
-    cprint(C_DIM, f"  origin 已设为默认拉取源")
-    
-    # 设置推送当前分支到 origin
+
+    # 设置拉取源
+    git_cmd("config", "--local", f"branch.{branch_name}.remote", pull_source_name)
+    cprint(C_DIM, f"  {pull_source_name} 已设为默认拉取源")
+
+    # 设置推送当前分支到拉取源
     git_cmd("config", "--local", f"branch.{branch_name}.push", "HEAD")
-    
-    # 获取所有 remote (除 origin 外)
+
+    # 获取所有 remote (除拉取源外)
     r = git_cmd("remote", capture=True, check=False)
     if r.returncode == 0:
-        remotes = [r.strip() for r in r.stdout.strip().split('\n') if r.strip() and r.strip() != 'origin']
+        remotes = [r.strip() for r in r.stdout.strip().split('\n') if r.strip() and r.strip() != pull_source_name]
         if remotes:
             # 配置每个 remote 的 push refspec
             for remote in remotes:
                 git_cmd("config", "--local", f"remote.{remote}.push", "+refs/heads/*:refs/heads/*")
             cprint(C_DIM, f"  已配置推送到 {len(remotes)} 个远程: {', '.join(remotes)}")
-    
+
     cprint(C_GREEN, "✓ 推送配置完成")
     return True
 
@@ -510,16 +557,36 @@ def main():
     cprint(C_GREEN, f"找到 {len(targets)} 个推送目标\n")
 
     # ── Step 5: 处理每个目标 ──
-    success_count = 0
+    # 分配 remote 名称
+    private_counter = 1
+    named_targets = []
     for i, target in enumerate(targets):
-        repo_name = target['repo_name'] or ask_repo_name(target, dir_name)
-        # 第一个目标命名为 origin，后续目标命名为 private-1, private-2...
-        if i == 0:
-            remote_name = "origin"
+        if target.get('explicit_remote_name'):
+            remote_name = target['explicit_remote_name']
+        elif i == 0:
+            remote_name = 'origin'
         else:
-            remote_name = f"private-{i}"
+            remote_name = f'private-{private_counter}'
+            private_counter += 1
+        named_targets.append((remote_name, target))
 
-        cprint(C_BOLD, f"── 目标 [{i+1}/{len(targets)}]: {target['ssh_spec']} ──")
+    # 分离 SSH 和 URL 目标
+    ssh_named = [(n, t) for n, t in named_targets if t.get('type') != 'url']
+    url_named = [(n, t) for n, t in named_targets if t.get('type') == 'url']
+
+    # 处理 URL 目标: 仅配置 remote (不创建裸仓库、不推送)
+    if url_named:
+        cprint(C_BOLD, "\n── URL 目标 (仅配置 remote) ──")
+        for remote_name, target in url_named:
+            setup_remote(remote_name, target['url'])
+            cprint(C_DIM, f"  需手动推送: git push {remote_name}")
+
+    # 处理 SSH 目标: 完整推送流程
+    success_count = 0
+    for idx, (remote_name, target) in enumerate(ssh_named):
+        repo_name = target['repo_name'] or ask_repo_name(target, dir_name)
+
+        cprint(C_BOLD, f"\n── SSH 目标 [{idx+1}/{len(ssh_named)}]: {target['ssh_spec']} ──")
 
         conn = SSHConnection(target)
         try:
@@ -540,18 +607,23 @@ def main():
 
     # ── 总结 ──
     cprint(C_BOLD, f"\n══════════════════════════")
-    if success_count == len(targets):
-        cprint(C_GREEN, f"✓ 全部 {success_count} 个目标推送完成")
+    ssh_total = len(ssh_named)
+    if success_count == ssh_total:
+        cprint(C_GREEN, f"✓ 全部 {success_count} 个 SSH 目标推送完成")
     elif success_count > 0:
-        cprint(C_YELLOW, f"⚠ {success_count}/{len(targets)} 个目标推送完成")
+        cprint(C_YELLOW, f"⚠ {success_count}/{ssh_total} 个 SSH 目标推送完成")
     else:
-        cprint(C_RED, f"✗ 所有目标推送失败")
+        cprint(C_RED, f"✗ 所有 SSH 目标推送失败")
+    if url_named:
+        cprint(C_DIM, f"  (另有 {len(url_named)} 个 URL 目标需手动推送)")
     
     # ── Step 6: 设置默认推送配置 ──
+    # 拉取源始终为第一行 (无论 remote 名)
+    pull_source_name = named_targets[0][0] if named_targets else 'origin'
     if success_count > 0:
         branch = get_current_branch()
         if branch and branch != "HEAD":
-            set_default_push_config(branch)
+            set_default_push_config(branch, pull_source_name)
     
     print()
 
