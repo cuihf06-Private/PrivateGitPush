@@ -142,9 +142,14 @@ def parse_gitprivatetarget(filepath, default_repo_name=None):
                 or re.match(r'^git@', rest[0])
             ):
                 url = rest[0]
+                # 解析 visibility 列 (Private/Public), 默认 Private
+                visibility = 'Private'
+                if len(rest) >= 2 and rest[1] in ('Private', 'Public', 'private', 'public'):
+                    visibility = rest[1].capitalize()
                 targets.append({
                     'type': 'url',
                     'url': url,
+                    'visibility': visibility,
                     'explicit_remote_name': explicit_name,
                 })
                 continue

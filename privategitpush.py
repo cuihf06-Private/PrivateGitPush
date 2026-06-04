@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-PrivateGitPush - 将 git 仓库通过 SSH 推送到私有服务器
+PrivateGitPush - 将 git 仓库推送到私有服务器和 GitHub
 
 在任意目录运行此工具，它会:
-1. 检测当前目录是否为 git 仓库，若否则初始化
+1. 检测当前目录是否为 git 仓库，若否初始化
 2. 确保 git user.name/user.email 已配置 (交互询问)
-3. 自动提交所有未提交的变更 (commit 格式: yymmdd_自动推送_更改x_新增y_删除z)
-4. 读取 .gitprivatetarget 中的目标服务器配置
-5. 在远程服务器检查/创建裸仓库 (git init --bare)
+3. 自动提交所有未提交的变更
+4. 读取 .gitprivatetarget 中的目标配置
+5. 处理目标: SSH 目标→创建裸仓库+推送, URL 目标→认证+创建+推送
 6. 配置 git remote 并推送
 
 .gitprivatetarget 格式 (每行一个目标):
-  # 显式 remote 名 (推荐，与位置无关)
-  origin user@host:port /path/to/repos/base/dir [repo_name]
-  github https://github.com/user/repo
-  # SSH 格式 (原有，按位置分配)
-  user@host:port /path/to/repos/base/dir [repo_name]
+  # 显式 remote 名 + SSH (推荐)
+  origin user@host:port /path/to/repos/dir [repo_name]
+  # 显式 remote 名 + URL (含 visibility)
+  github https://github.com/user/repo [Private|Public]
+  # SSH 格式 (原有)
+  user@host:port /path/to/repos/dir [repo_name]
 
 示例:
-  origin cuihf@tinybot.cloud:29798 /data1/cuihf/GitRepos PrivateGitPush
-  github https://github.com/cuihf/myproject
-  cuihf@tinybot.cloud:29798 /data1/cuihf/GitRepos myproject
-  cuihf@192.168.1.100:22 /home/user/repos another-repo
+  origin https://github.com/cuihf06-Private/PrivateGitPush Public
+  private1 cuihf@tinybot.cloud:29798 /data1/cuihf/GitRepos PrivateGitPush
 """
 
 import os
@@ -49,7 +48,7 @@ def cprint(color, msg, **kw):
 
 
 # ── 通用命令执行 ───────────────────────────────────────────
-def run_cmd(cmd, check=True, capture=False, env=None, timeout=None):
+def run_cmd(cmd, check=True, capture=False, env=None, timeout=None, input_data=None):
     """执行外部命令。"""
     run_env = os.environ.copy()
     if env:
@@ -60,6 +59,10 @@ def run_cmd(cmd, check=True, capture=False, env=None, timeout=None):
         kw['text'] = True
     if timeout:
         kw['timeout'] = timeout
+    if input_data is not None:
+        kw['input'] = input_data
+        if not kw.get('text'):
+            kw['text'] = True
     return subprocess.run(cmd, **kw)
 
 
@@ -299,9 +302,14 @@ def parse_gitprivatetarget(filepath):
                 or re.match(r'^git@', rest[0])
             ):
                 url = rest[0]
+                # 解析 visibility 列 (Private/Public), 默认 Private
+                visibility = 'Private'
+                if len(rest) >= 2 and rest[1] in ('Private', 'Public', 'private', 'public'):
+                    visibility = rest[1].capitalize()
                 targets.append({
                     'type': 'url',
                     'url': url,
+                    'visibility': visibility,
                     'explicit_remote_name': explicit_name,
                 })
                 continue
@@ -377,6 +385,96 @@ def ensure_remote_repo(conn, target, repo_name):
         cprint(C_RED, "✗ SSH 连接或仓库操作失败")
         return False
 
+    return True
+
+
+# ── GitHub 仓库管理 ───────────────────────────────────────
+def parse_github_url(url):
+    """从 GitHub URL 中解析 owner 和 repo 名。
+
+    支持: https://github.com/owner/repo, https://github.com/owner/repo.git
+    返回: (owner, repo) 或 None
+    """
+    m = re.match(r'^https?://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$', url)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def ensure_gh_auth():
+    """确保 gh CLI 已认证。
+
+    检查 gh auth status，若未认证则交互式要求用户提供 token。
+    """
+    cprint(C_BLUE, "检查 gh CLI 认证状态...")
+    r = run_cmd(['gh', 'auth', 'status'], capture=True, check=False)
+    if r.returncode == 0 and 'Logged in' in (r.stdout or '') + (r.stderr or ''):
+        # 提取登录用户名
+        output = (r.stderr or '') + (r.stdout or '')
+        m = re.search(r'Logged in to github\.com as (\S+)', output)
+        if m:
+            cprint(C_GREEN, f"✓ gh 已认证: {m.group(1)}")
+        else:
+            cprint(C_GREEN, "✓ gh 已认证")
+        return True
+
+    cprint(C_YELLOW, "gh CLI 未认证，需要登录")
+    cprint(C_DIM, "请提供 GitHub Personal Access Token (需要有 repo 权限)")
+    cprint(C_DIM, "创建 Token: https://github.com/settings/tokens")
+
+    # 交互式输入 token
+    token = input("请输入 GitHub Token: ").strip()
+    if not token:
+        cprint(C_RED, "✗ 未提供 Token，无法操作 GitHub")
+        return False
+
+    # 用 token 登录
+    cprint(C_BLUE, "正在登录 gh CLI...")
+    r = run_cmd(['gh', 'auth', 'login', '--with-token'],
+                capture=True, check=False,
+                input_data=token)
+    if r.returncode != 0:
+        cprint(C_RED, "✗ gh 登录失败")
+        cprint(C_DIM, f"  {r.stderr or r.stdout}")
+        return False
+
+    cprint(C_GREEN, "✓ gh CLI 登录成功")
+    return True
+
+
+def check_github_repo_exists(owner, repo):
+    """检查 GitHub 仓库是否已存在。
+
+    返回: True/False
+    """
+    r = run_cmd(['gh', 'repo', 'view', f'{owner}/{repo}',
+                 '--json', 'name'],
+                capture=True, check=False)
+    return r.returncode == 0
+
+
+def create_github_repo(owner, repo, visibility='Private'):
+    """创建 GitHub 仓库。
+
+    visibility: 'Private' 或 'Public'
+    返回: True/False
+    """
+    vis_flag = '--private' if visibility == 'Private' else '--public'
+    cprint(C_BLUE, f"创建 GitHub 仓库: {owner}/{repo} ({visibility})")
+
+    # gh repo create <name> --private/--public
+    # 不使用 --source/--push, 仅创建远程仓库, 推送由后续步骤处理
+    # input_data='' 防止交互式提示阻塞
+    r = run_cmd(['gh', 'repo', 'create', f'{owner}/{repo}',
+                 vis_flag],
+                capture=True, check=False,
+                input_data='')
+    if r.returncode != 0:
+        cprint(C_RED, f"✗ 创建 GitHub 仓库失败")
+        cprint(C_DIM, f"  {r.stderr or r.stdout}")
+        return False
+
+    cprint(C_GREEN, f"✓ GitHub 仓库已创建: {owner}/{repo}")
     return True
 
 
@@ -574,12 +672,49 @@ def main():
     ssh_named = [(n, t) for n, t in named_targets if t.get('type') != 'url']
     url_named = [(n, t) for n, t in named_targets if t.get('type') == 'url']
 
-    # 处理 URL 目标: 仅配置 remote (不创建裸仓库、不推送)
+    # 处理 URL 目标: 认证 + 创建仓库 + 配置 remote + 推送
+    url_success_count = 0
     if url_named:
-        cprint(C_BOLD, "\n── URL 目标 (仅配置 remote) ──")
+        cprint(C_BOLD, "\n── URL 目标处理 ──")
         for remote_name, target in url_named:
-            setup_remote(remote_name, target['url'])
-            cprint(C_DIM, f"  需手动推送: git push {remote_name}")
+            url = target['url']
+            visibility = target.get('visibility', 'Private')
+            cprint(C_BOLD, f"\n[{remote_name}] {url} ({visibility})")
+
+            # 判断是否为 GitHub URL
+            gh_info = parse_github_url(url)
+            if gh_info:
+                owner, repo = gh_info
+                cprint(C_DIM, f"  GitHub: {owner}/{repo}")
+
+                # Step A: 确保 gh 已认证
+                if not ensure_gh_auth():
+                    cprint(C_RED, "✗ GitHub 认证失败，跳过此目标")
+                    setup_remote(remote_name, url)
+                    cprint(C_DIM, f"  需手动推送: git push {remote_name}")
+                    continue
+
+                # Step B: 检查仓库是否存在，不存在则创建
+                if check_github_repo_exists(owner, repo):
+                    cprint(C_GREEN, f"✓ GitHub 仓库已存在: {owner}/{repo}")
+                else:
+                    cprint(C_YELLOW, f"GitHub 仓库不存在: {owner}/{repo}")
+                    if not create_github_repo(owner, repo, visibility):
+                        cprint(C_RED, "✗ 仓库创建失败，跳过此目标")
+                        setup_remote(remote_name, url)
+                        cprint(C_DIM, f"  需手动推送: git push {remote_name}")
+                        continue
+            else:
+                cprint(C_DIM, f"  非 GitHub URL，仅配置 remote")
+
+            # Step C: 配置 git remote
+            setup_remote(remote_name, url)
+
+            # Step D: 推送
+            if push_to_remote(remote_name):
+                url_success_count += 1
+            else:
+                cprint(C_YELLOW, f"⚠ 推送到 {remote_name} 失败，可能需手动推送")
 
     # 处理 SSH 目标: 完整推送流程
     success_count = 0
@@ -615,7 +750,13 @@ def main():
     else:
         cprint(C_RED, f"✗ 所有 SSH 目标推送失败")
     if url_named:
-        cprint(C_DIM, f"  (另有 {len(url_named)} 个 URL 目标需手动推送)")
+        url_total = len(url_named)
+        if url_success_count == url_total:
+            cprint(C_GREEN, f"✓ 全部 {url_success_count} 个 URL 目标推送完成")
+        elif url_success_count > 0:
+            cprint(C_YELLOW, f"⚠ {url_success_count}/{url_total} 个 URL 目标推送完成")
+        else:
+            cprint(C_DIM, f"  {url_total} 个 URL 目标需手动推送")
     
     # ── Step 6: 设置默认推送配置 ──
     # 拉取源始终为第一行 (无论 remote 名)
