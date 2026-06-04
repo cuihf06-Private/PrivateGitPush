@@ -10,6 +10,7 @@
 - **SSH 多路复用**：支持 OpenSSH ControlMaster/ControlPersist，同一目标只需输入一次密码
 - **交互式配置**：缺少 git 用户配置或推送目标配置时，交互询问并自动写入
 - **多目标推送**：支持同时推送到多个服务器
+- **VSCode 集成**：配置 SSH 密钥后，VSCode 推送按钮可直接使用
 
 ## 系统要求
 
@@ -106,8 +107,13 @@ Step 4 ─ 查找/创建配置文件
 Step 5 ─ 处理每个推送目标
   ├─ SSH 连接 (首次需输入密码)
   ├─ 检查远程裸仓库 → 不存在则 git init --bare 创建
-  ├─ 配置 git remote (名为 private 或 private-0/private-1...)
+  ├─ 配置 git remote (第一个目标为 origin，其余为 private-1/private-2...)
   └─ git push --all + git push --tags
+
+Step 6 ─ 设置默认推送配置
+  ├─ origin 设为默认拉取源 (branch.<name>.remote=origin)
+  ├─ 配置推送到所有 remote
+  └─ VSCode 推送按钮直接推送到 origin
 
 ══════════════════════════
 ✓ 全部 N 个目标推送完成
@@ -171,10 +177,15 @@ yymmdd_自动推送_更改x_新增y_删除z
 
 ## Git Remote 名称规则
 
-| 目标数量 | Remote 名称 |
-|----------|-------------|
-| 1 个 | `private` |
-| 2+ 个 | `private-0`, `private-1`, `private-2` ... |
+| 目标数量 | Remote 名称 | 用途 |
+|----------|-------------|------|
+| 第 1 个 | `origin` | 默认拉取源，VSCode 推送按钮目标 |
+| 第 2+ 个 | `private-1`, `private-2` ... | 额外备份目标 |
+
+**VSCode 集成：**
+- 运行 PrivateGitPush 后，VSCode 的"发布 branch"按钮直接推送到 `origin`
+- VSCode 源代码管理面板显示 `origin` 为云端仓库
+- 可通过 `git remote -v` 查看当前配置
 
 后续可通过标准 git 命令管理：
 
@@ -183,13 +194,13 @@ yymmdd_自动推送_更改x_新增y_删除z
 git remote -v
 
 # 手动推送
-git push private --all
+git push origin --all
 
 # 修改 remote URL
-git remote set-url private ssh://new-host:port/path
+git remote set-url origin ssh://new-host:port/path
 
-# 删除 remote
-git remote remove private
+# 删除多余的 remote
+git remote remove private-1
 ```
 
 ## 推送策略
@@ -201,9 +212,40 @@ git remote remove private
 ## 注意事项
 
 1. **`.gitprivatetarget` 建议加入 `.gitignore`**：此文件包含服务器地址信息，通常不应推送到公开仓库
-2. **SSH 密钥认证**：推荐配置 SSH 密钥以实现免密推送，即使不启用多路复用也能避免每次输入密码
+2. **SSH 密钥认证**（强烈推荐）：配置 SSH 密钥后可实现免密推送，VSCode 推送按钮也能正常工作。详见下方「SSH 密钥配置」
 3. **远程权限**：确保 SSH 用户在远程服务器上有 `base_path` 目录的写入权限
 4. **裸仓库**：远程创建的是 `git init --bare` 裸仓库，不包含工作区文件，仅作为推送目标
+5. **VSCode 凭证问题**：如果 VSCode 推送时出现 "Missing or invalid credentials"，是因为 SSH 需要密码但 VSCode 后台进程无法弹出输入框。请配置 SSH 密钥认证（见下方）
+
+## SSH 密钥配置（VSCode 推送必需）
+
+VSCode 的 Git 推送是后台进程，**不支持交互式输入密码**。如果出现 "Missing or invalid credentials" 错误，需要配置 SSH 密钥认证：
+
+### 快速配置步骤
+
+```bash
+# 1. 生成 SSH 密钥（如果还没有）
+ssh-keygen -t ed25519 -C "your_email@example.com"
+
+# 2. 将公钥复制到远程服务器（只需一次）
+ssh-copy-id -p 29798 cuihf@tinybot.cloud
+
+# 3. 测试无密码登录
+ssh -p 29798 cuihf@tinybot.cloud
+```
+
+### 验证配置
+
+```bash
+# 测试 SSH 连接（不应提示输入密码）
+ssh -T -p 29798 cuihf@tinybot.cloud
+
+# 测试 git 推送（不应提示输入密码）
+cd /path/to/repo
+git push origin --dry-run
+```
+
+> 配置 SSH 密钥后，PrivateGitPush 和 VSCode 推送按钮都能无需密码正常工作。
 
 ## 故障排查
 
@@ -214,6 +256,7 @@ git remote remove private
 | 推送失败 | 远程仓库已有冲突内容 | `git push --force` 或手动解决 |
 | 密码需多次输入 | OpenSSH < 5.6 或不支持多路复用 | 配置 SSH 密钥认证 |
 | 提交失败 | user.name/email 未配置 | 工具会自动询问，也可手动 `git config --local user.name "xxx"` |
+| **VSCode: Missing or invalid credentials** | SSH 需要密码但 VSCode 无法弹出输入框 | **配置 SSH 密钥认证（见上方）** |
 
 ## 目录结构
 
