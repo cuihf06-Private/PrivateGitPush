@@ -352,6 +352,36 @@ def setup_remote(name, url):
     return True
 
 
+def set_default_push_config(branch_name):
+    """
+    设置当前分支的默认推送配置。
+    
+    - origin 作为默认拉取源 (第一个目标)
+    - 自动配置 branch.<name>.remote 和 push
+    """
+    cprint(C_BLUE, "设置默认推送配置...")
+    
+    # 设置 origin 为默认拉取源
+    git_cmd("config", "--local", f"branch.{branch_name}.remote", "origin")
+    cprint(C_DIM, f"  origin 已设为默认拉取源")
+    
+    # 设置推送当前分支到 origin
+    git_cmd("config", "--local", f"branch.{branch_name}.push", "HEAD")
+    
+    # 获取所有 remote (除 origin 外)
+    r = git_cmd("remote", capture=True, check=False)
+    if r.returncode == 0:
+        remotes = [r.strip() for r in r.stdout.strip().split('\n') if r.strip() and r.strip() != 'origin']
+        if remotes:
+            # 配置每个 remote 的 push refspec
+            for remote in remotes:
+                git_cmd("config", "--local", f"remote.{remote}.push", "+refs/heads/*:refs/heads/*")
+            cprint(C_DIM, f"  已配置推送到 {len(remotes)} 个远程: {', '.join(remotes)}")
+    
+    cprint(C_GREEN, "✓ 推送配置完成")
+    return True
+
+
 # ── 推送 ────────────────────────────────────────────────────
 def push_to_remote(name, env=None):
     """推送所有分支和标签到远程。"""
@@ -483,7 +513,11 @@ def main():
     success_count = 0
     for i, target in enumerate(targets):
         repo_name = target['repo_name'] or ask_repo_name(target, dir_name)
-        remote_name = f"private-{i}" if len(targets) > 1 else "private"
+        # 第一个目标命名为 origin，后续目标命名为 private-1, private-2...
+        if i == 0:
+            remote_name = "origin"
+        else:
+            remote_name = f"private-{i}"
 
         cprint(C_BOLD, f"── 目标 [{i+1}/{len(targets)}]: {target['ssh_spec']} ──")
 
@@ -512,8 +546,16 @@ def main():
         cprint(C_YELLOW, f"⚠ {success_count}/{len(targets)} 个目标推送完成")
     else:
         cprint(C_RED, f"✗ 所有目标推送失败")
+    
+    # ── Step 6: 设置默认推送配置 ──
+    if success_count > 0:
+        branch = get_current_branch()
+        if branch and branch != "HEAD":
+            set_default_push_config(branch)
+    
     print()
 
 
 if __name__ == "__main__":
     main()
+
